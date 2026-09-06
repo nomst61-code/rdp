@@ -1,0 +1,304 @@
+name: RDP GAMING LOW-LAG
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 355
+
+    steps:
+
+      # =========================================================
+      # 1. LOW-LAG WINDOWS / RDP SETTINGS
+      # =========================================================
+      - name: Configure Low-Lag RDP
+        shell: pwsh
+        run: |
+          Write-Host "=== Configuring RDP Low-Lag ==="
+
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          # Allow RDP
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+          # Explicit RDP TCP/UDP rules
+          Remove-NetFirewallRule -DisplayName "RDP-LowLag-TCP" -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName "RDP-LowLag-UDP" -ErrorAction SilentlyContinue
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-LowLag-TCP" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -Action Allow `
+            -Profile Any
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-LowLag-UDP" `
+            -Direction Inbound `
+            -Protocol UDP `
+            -LocalPort 3389 `
+            -Action Allow `
+            -Profile Any
+
+          # Keep RDP transport capable of using UDP
+          $rdpPolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+
+          New-Item -Path $rdpPolicy -Force | Out-Null
+
+          # 0 = do not disable UDP
+          New-ItemProperty `
+            -Path $rdpPolicy `
+            -Name "fDisableUDP" `
+            -PropertyType DWord `
+            -Value 0 `
+            -Force | Out-Null
+
+          # Reduce RDP visual traffic
+          New-ItemProperty `
+            -Path $rdpPolicy `
+            -Name "fDisableWallpaper" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          New-ItemProperty `
+            -Path $rdpPolicy `
+            -Name "fDisableFullWindowDrag" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          New-ItemProperty `
+            -Path $rdpPolicy `
+            -Name "fDisableMenuAnims" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          New-ItemProperty `
+            -Path $rdpPolicy `
+            -Name "fDisableThemes" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          # Prefer performance power plan
+          try {
+            powercfg /setactive SCHEME_MIN
+          } catch {
+            Write-Warning "Could not change power plan."
+          }
+
+          # Restart RDP service
+          Restart-Service TermService -Force
+
+          Write-Host "RDP low-lag configuration completed."
+
+      # =========================================================
+      # 2. CREATE RDP USER
+      # =========================================================
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $username = $env:RDP_USERNAME
+          $password = $env:RDP_PASSWORD
+
+          if ([string]::IsNullOrWhiteSpace($username)) {
+            throw "RDP_USERNAME Secret belum diisi."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($password)) {
+            throw "RDP_PASSWORD Secret belum diisi."
+          }
+
+          if ($password.Length -lt 8) {
+            throw "RDP_PASSWORD minimal 8 karakter."
+          }
+
+          if ($password -eq "***") {
+            throw "RDP_PASSWORD tidak boleh bernilai ***."
+          }
+
+          Write-Host "Creating RDP user..."
+
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $existingUser) {
+
+            New-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -AccountNeverExpires `
+              -PasswordNeverExpires `
+              -UserMayNotChangePassword
+
+            Write-Host "User created."
+
+          } else {
+
+            Set-LocalUser `
+              -Name $username `
+              -Password $securePassword
+
+            Write-Host "User password updated."
+          }
+
+          # Add to Remote Desktop Users
+          try {
+            Add-LocalGroupMember `
+              -Group "Remote Desktop Users" `
+              -Member $username `
+              -ErrorAction Stop
+          } catch {
+            Write-Host "User already belongs to Remote Desktop Users."
+          }
+
+          # Admin privileges
+          try {
+            Add-LocalGroupMember `
+              -Group "Administrators" `
+              -Member $username `
+              -ErrorAction Stop
+          } catch {
+            Write-Host "User already belongs to Administrators."
+          }
+
+          "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          Write-Host "RDP user ready."
+
+      # =========================================================
+      # 3. INSTALL TAILSCALE
+      # =========================================================
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          Write-Host "Installing Tailscale..."
+
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.102.3-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $installer `
+            -UseBasicParsing
+
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait `
+            -NoNewWindow
+
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Tailscale installed."
+
+      # =========================================================
+      # 4. CONNECT TAILSCALE
+      # =========================================================
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "TAILSCALE_AUTH_KEY Secret belum diisi."
+          }
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+            throw "Tailscale executable tidak ditemukan."
+          }
+
+          & $ts up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="rdp-$env:GITHUB_RUN_ID"
+
+          Write-Host "Waiting for Tailscale IP..."
+
+          $ip = $null
+
+          for ($i = 0; $i -lt 30; $i++) {
+
+            $result = & $ts ip -4 2>$null
+
+            if ($result) {
+              $ip = ($result | Select-Object -First 1).Trim()
+            }
+
+            if ($ip -match "^\d{1,3}(\.\d{1,3}){3}$") {
+              break
+            }
+
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $ip) {
+            throw "Tailscale IP tidak ditemukan."
+          }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale IP: $ip"
+
+      # =========================================================
+      # 5. FINAL CHECK
+      # =========================================================
+      - name: Verify RDP Service
+        shell: pwsh
+        run: |
+          Write-Host "Checking RDP service..."
+
+          $service = Get-Service TermService
+
+          if ($service.Status -ne "Running") {
+            Start-Service TermService
+          }
+
+          Write-Host "RDP Service: Running"
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "          RDP GAMING LOW-LAG"
+          Write-Host "========================================"
+          Write-Host "Address  : $env:TAILSCALE_IP"
+          Write-Host "Username : $env:RDP_USERNAME"
+          Write-Host "Password : $env:RDP_PASSWORD"
+          Write-Host "Port     : 3389"
+          Write-Host "========================================"
+
+      # =========================================================
+      # 6. KEEP RUNNER ALIVE
+      # =========================================================
+      - name: Keep RDP Alive
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "RDP ACTIVE"
+          Write-Host "Connect using the Tailscale IP above."
+          Write-Host ""
+
+          while ($true) {
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP is running..."
+            Start-Sleep -Seconds 60
+          }
